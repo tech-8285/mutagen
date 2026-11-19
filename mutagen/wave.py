@@ -32,13 +32,13 @@ class error(_IffError):
 
 
 class _WaveFile(RiffFile):
-    """Representation of a RIFF/WAVE file"""
+    """Representation of a RIFF/WAVE, RF64/WAVE or BW64/WAVE file"""
 
     def __init__(self, fileobj):
         RiffFile.__init__(self, fileobj)
 
         if self.file_type != u'WAVE':
-            raise error("Expected RIFF/WAVE.")
+            raise error("Expected RIFF/WAVE, RF64/WAVE or BW64/WAVE.")
 
         # Normalize ID3v2-tag-chunk to lowercase
         if u'ID3' in self:
@@ -50,7 +50,9 @@ class WaveStreamInfo(StreamInfo):
 
     Microsoft WAVE file information.
 
-    Information is parsed from the 'fmt' & 'data'chunk of the RIFF/WAVE file
+    Information is parsed from the 'fmt' & 'data'chunk of the RIFF/WAVE file.
+    RF64 and BW64 files are supported as well, in which case the sizes are
+    taken from the 'ds64' chunk.
 
     Attributes:
         length (`float`): audio length, in seconds
@@ -177,7 +179,8 @@ class WAVE(FileType):
     def score(filename, fileobj, header):
         filename = filename.lower()
 
-        riff_wave = header.startswith(b"RIFF") and header[8:12] == b"WAVE"
+        riff_wave = (header[:4] in (b"RIFF", b"RF64", b"BW64")
+                     and header[8:12] == b"WAVE")
         return (2 * riff_wave
                 + endswith(filename, b".wav") + endswith(filename, b".wave"))
 

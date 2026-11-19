@@ -1,9 +1,11 @@
 
 import os
+import tempfile
 
 from mutagen._riff import RiffFile, RiffChunk
 
 from tests import TestCase, DATA_DIR, get_temp_copy
+from tests.test_wave import make_rf64_file, parse_rf64
 
 
 class TRiffFile(TestCase):
@@ -142,3 +144,68 @@ class TRiffFile(TestCase):
         self.failUnlessEqual(info_tags['INAM'], 'Silence')
         self.failUnlessEqual(info_tags['ITRK'], '02/10')
         self.failUnlessEqual(info_tags['ICRD'], '2004')
+
+
+class TRiffFile64(TestCase):
+
+    ROOT_IDS = (b'RF64', b'BW64')
+
+    def _open(self, data, mode='rb'):
+        fileobj = open(self._write(data), mode)
+        self.addCleanup(fileobj.close)
+        return fileobj
+
+    def _write(self, data):
+        fd, name = tempfile.mkstemp(suffix='.wav')
+        os.write(fd, data)
+        os.close(fd)
+        self.addCleanup(os.unlink, name)
+        return name
+
+    def test_root_chunk(self):
+        for root_id in self.ROOT_IDS:
+            with self.subTest(root_id=root_id):
+                data = make_rf64_file(root_id)
+                riff = RiffFile(self._open(data))
+                self.assertEqual(riff.file_type, 'WAVE')
+                self.assertEqual(riff.root.id, root_id.decode())
+                self.assertEqual(riff.root.size, len(data))
+                self.assertIn(u'fmt', riff)
+                self.assertIn(u'data', riff)
+                self.assertIn(u'ds64', riff)
+                self.assertEqual(riff[u'data'].data_size, 48000 * 5 * 6)
+                self.assertEqual(riff[u'fmt'].data_size,
+                                 16)
+
+    def test_data_size_from_ds64(self):
+        data = make_rf64_file(data_size=1000)
+        riff = RiffFile(self._open(data))
+        self.assertEqual(riff[u'data'].data_size, 1000)
+        # The 32 bit header is still a placeholder
+        fileobj = riff.root._fileobj
+        fileobj.seek(riff[u'data'].offset + 4)
+        self.assertEqual(fileobj.read(4), b'\xff\xff\xff\xff')
+
+    def test_insert_chunk_keeps_ds64_valid(self):
+        for root_id in self.ROOT_IDS:
+            with self.subTest(root_id=root_id):
+                fileobj = self._open(make_rf64_file(root_id), 'rb+')
+                fn = fileobj.name
+                riff = RiffFile(fileobj)
+                chunk = riff.insert_chunk(u'id3')
+                chunk.resize(10)
+                chunk.write(b'0123456789')
+                fileobj.flush()
+
+                with open(fn, 'rb') as f:
+                    parsed = parse_rf64(f.read())
+                self.assertEqual(parsed['root_size'], 0xFFFFFFFF)
+                self.assertEqual(parsed['ds64'][0], os.path.getsize(fn) - 8)
+                self.assertEqual(parsed['ds64'][1], 48000 * 5 * 6)
+                self.assertNotIn(
+                    b'id3 ', [c[0] for c in parsed['chunks']
+                              if c[1] == 0xFFFFFFFF])
+
+                reread = RiffFile(self._open(open(fn, 'rb').read()))
+                self.assertEqual(reread[u'id3'].data_size, 10)
+                self.assertEqual(reread[u'id3'].read(), b'0123456789')
