@@ -1,3 +1,15 @@
+.. _release-1.49.0:
+
+1.49.0 - UNRELEASED
+-------------------
+
+* MP4: Read QuickTime chapter tracks (``moov.trak.tref.chap``) in addition
+  to ``moov.udta.chpl``. Time stamps follow the chapter track's own timescale
+  and edit list and titles honor the text encoding declared by the sample.
+  When both sources are present the chapter track is used, and broken
+  references or incomplete sample tables fall back to ``chpl`` or to no
+  chapters while still allowing the file to be opened.
+
 .. _release-1.48.1:
 
 1.48.1 - 2026-06-25

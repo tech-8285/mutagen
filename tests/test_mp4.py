@@ -3,6 +3,7 @@ import os
 import struct
 import subprocess
 from io import BytesIO
+from tempfile import mkstemp
 
 import pytest
 
@@ -1211,6 +1212,350 @@ class TMP4Chapters(TMP4):
         self.failUnlessEqual(len(chapters), 112)
         for i, c in enumerate(chapters):
             self.failUnlessEqual(c.title, str(i + 1).zfill(3))
+
+    def test_falls_back_to_chpl_when_track_unusable(self):
+        # nero-chapters.m4b references a text chapter track, but this test
+        # file only carries metadata: the track's sample table points at
+        # data which isn't in the file. The 'chpl' box must still work.
+        from mutagen.mp4 import MP4Chapters
+        with open(self.filename, "rb") as fileobj:
+            atoms = Atoms(fileobj)
+            chapters = MP4Chapters(atoms, fileobj)
+        self.failUnlessEqual(len(chapters), 112)
+        self.failUnlessAlmostEqual(chapters[1].start, 17.507, 3)
+        self.failUnlessAlmostEqual(chapters[-1].start, 168998.359, 3)
+        for i, c in enumerate(chapters):
+            self.failUnlessEqual(c.title, str(i + 1).zfill(3))
+
+    def test_chpl_named_free_still_opens(self):
+        # Renaming the 'chpl' box away leaves no readable chapter source;
+        # the file must still open and simply report no chapters.
+        with open(self.filename, "rb") as fileobj:
+            data = bytearray(fileobj.read())
+        index = data.index(b"chpl") - 4
+        data[index + 4:index + 8] = b"free"
+        filename = _write_temp(bytes(data))
+        try:
+            audio = MP4(filename)
+        finally:
+            os.unlink(filename)
+        self.failUnlessEqual(len(audio.chapters), 0)
+
+    def test_chapters_survive_save(self):
+        before = [(c.start, c.title) for c in self.audio.chapters]
+        self.audio["\xa9nam"] = ["New Title"]
+        self.audio.save()
+        after = [(c.start, c.title) for c in MP4(self.filename).chapters]
+        self.failUnlessEqual(before, after)
+
+    def test_starts_are_monotonic(self):
+        starts = [c.start for c in self.audio.chapters]
+        self.failUnlessEqual(starts, sorted(starts))
+
+    def test_pprint(self):
+        text = self.audio.pprint()
+        self.failUnless("chapters=" in text)
+        self.failUnless("112" in text)
+
+
+def _mp4_box(name, payload):
+    return struct.pack(">I4s", len(payload) + 8, name) + payload
+
+
+def _mp4_full_box(name, version, flags, payload):
+    return _mp4_box(name, struct.pack(">B3s", version,
+                                     flags.to_bytes(3, "big")) + payload)
+
+
+def _qt_text_sample(text, encoding=b"\x00\x00\x01\x00"):
+    """Render a QuickTime text sample with a trailing 'encd' box."""
+
+    if isinstance(text, str):
+        text = text.encode("utf-8")
+    body = struct.pack(">H", len(text)) + text
+    if encoding is not None:
+        body += _mp4_box(b"encd", encoding)
+    return body
+
+
+def _build_chapter_mp4(samples, *, chunk_layout=None, timescale=1000,
+                       deltas=None, use_co64=False, chpl_entries=None,
+                       tref_ids=(2,), elst_entries=None, uniform=None,
+                       incomplete_stts=False, missing_stco=False):
+    """Build a minimal MP4 with one audio track and a chapter text track.
+
+    The audio track has no sample table; only the chapter track is
+    complete enough to be read by MP4Chapters.
+    """
+
+    sizes = [len(s) for s in samples]
+    if chunk_layout is None:
+        chunk_layout = [[i] for i in range(len(samples))]
+    if deltas is None:
+        deltas = [timescale] * len(samples)
+
+    stts_runs = []
+    for delta in deltas:
+        if stts_runs and stts_runs[-1][1] == delta:
+            stts_runs[-1][0] += 1
+        else:
+            stts_runs.append([1, delta])
+    if incomplete_stts and len(stts_runs) > 1:
+        stts_runs = stts_runs[:-1]
+
+    stsc_runs = []
+    for index, chunk in enumerate(chunk_layout, 1):
+        count = len(chunk)
+        if not stsc_runs or stsc_runs[-1][1] != count:
+            stsc_runs.append([index, count, 1])
+
+    def stts(data):
+        payload = struct.pack(">I", len(data))
+        for count, delta in data:
+            payload += struct.pack(">II", count, delta)
+        return _mp4_full_box(b"stts", 0, 0, payload)
+
+    def stsc(data):
+        payload = struct.pack(">I", len(data))
+        for first, count, desc in data:
+            payload += struct.pack(">III", first, count, desc)
+        return _mp4_full_box(b"stsc", 0, 0, payload)
+
+    def stsz(data):
+        if uniform is not None and len(set(data)) == 1:
+            payload = struct.pack(">II", uniform, len(data))
+        else:
+            payload = struct.pack(">II", 0, len(data))
+            payload += b"".join(struct.pack(">I", size) for size in data)
+        return _mp4_full_box(b"stsz", 0, 0, payload)
+
+    def offsets(data):
+        payload = struct.pack(">I", len(data))
+        if use_co64:
+            payload += b"".join(struct.pack(">Q", o) for o in data)
+            return _mp4_full_box(b"co64", 0, 0, payload)
+        payload += b"".join(struct.pack(">I", o) for o in data)
+        return _mp4_full_box(b"stco", 0, 0, payload)
+
+    def elst(entries):
+        payload = struct.pack(">I", len(entries))
+        for seg, media_time, rate in entries:
+            payload += struct.pack(">IiI", seg, media_time, rate)
+        return _mp4_full_box(b"elst", 0, 0, payload)
+
+    def stsd(entry_name):
+        # 28 byte sample entry fields plus an empty trailing box so that
+        # AudioSampleEntry can parse it.
+        entry = struct.pack(">I4s", 44, entry_name) + b"\x00" * 28 + \
+            struct.pack(">I4s", 8, b"btrt")
+        return _mp4_full_box(b"stsd", 0, 0, struct.pack(">I", 1) + entry)
+
+    def tkhd(track_id, duration):
+        payload = struct.pack(">IIIII", 0, 0, track_id, 0, duration)
+        payload += b"\x00" * 60
+        return _mp4_full_box(b"tkhd", 0, 7, payload)
+
+    def mdhd(scale, duration):
+        payload = struct.pack(">IIII", 0, 0, scale, duration) + b"\x00" * 4
+        return _mp4_full_box(b"mdhd", 0, 0, payload)
+
+    def hdlr(handler):
+        return _mp4_full_box(b"hdlr", 0, 0, b"\x00" * 4 + handler +
+                             b"\x00" * 12 + b"Handler\x00")
+
+    def trak(track_id, handler, stbl_boxes, duration, edts=None,
+             refs=None):
+        children = [tkhd(track_id, duration)]
+        if edts is not None:
+            children.append(_mp4_box(b"edts", elst(edts)))
+        if refs is not None:
+            children.append(_mp4_box(b"tref", _mp4_box(
+                b"chap", b"".join(struct.pack(">I", r) for r in refs))))
+        children.append(_mp4_box(b"mdia", b"".join([
+            mdhd(timescale if handler == b"text" else 44100, duration),
+            hdlr(handler),
+            _mp4_box(b"minf", _mp4_box(b"stbl", b"".join(stbl_boxes))),
+        ])))
+        return _mp4_box(b"trak", b"".join(children))
+
+    total_duration = sum(deltas)
+    text_boxes = [stsd(b"text"), stsz(sizes), stts(stts_runs),
+                  stsc(stsc_runs)]
+    if not missing_stco:
+        text_boxes.append(offsets([0] * len(chunk_layout)))
+    text_trak = trak(2, b"text", text_boxes, total_duration,
+                     edts=elst_entries)
+    audio_trak = trak(1, b"soun", [stsd(b"mp4a")], total_duration,
+                      refs=tref_ids)
+
+    udta = b""
+    if chpl_entries is not None:
+        payload = struct.pack(">B3sI", 1, b"\x00\x00\x00", 0)
+        payload += struct.pack(">B", len(chpl_entries))
+        for start, title in chpl_entries:
+            payload += struct.pack(">Q", int(round(start * 10000000)))
+            raw = title.encode("utf-8")
+            payload += struct.pack(">B", len(raw)) + raw
+        udta = _mp4_box(b"udta", _mp4_box(b"chpl", payload))
+
+    mvhd = _mp4_full_box(b"mvhd", 0, 0, struct.pack(
+        ">IIII", 0, 0, 1000, total_duration) + b"\x00" * 80)
+
+    ftyp = _mp4_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso2mp41")
+    mdat_payload = b"".join(samples)
+
+    def make_moov(mdat_offset):
+        children = [mvhd, audio_trak, text_trak, udta]
+        moov = _mp4_box(b"moov", b"".join(children))
+        # Repoint the text chunk offsets at the sample data in mdat.
+        base = mdat_offset + 8
+        chunk_offsets = []
+        index = 0
+        for chunk in chunk_layout:
+            chunk_offsets.append(base + sum(sizes[:index]))
+            index += len(chunk)
+        old = offsets([0] * len(chunk_layout))
+        new = offsets(chunk_offsets)
+        assert len(old) == len(new)
+        return moov.replace(old, new, 1)
+
+    # The size of the moov with zero offsets is stable, so it can be laid
+    # out before mdat.
+    placeholder = make_moov(0)
+    mdat_offset = len(ftyp) + len(placeholder)
+    moov = make_moov(mdat_offset)
+    return ftyp + moov + _mp4_box(b"mdat", mdat_payload)
+
+
+def _write_temp(data, suffix=".m4b"):
+    fd, filename = mkstemp(suffix=suffix)
+    with os.fdopen(fd, "wb") as fileobj:
+        fileobj.write(data)
+    return filename
+
+
+class TMP4QuickTimeChapters(TestCase):
+
+    def load(self, data):
+        filename = _write_temp(data)
+        try:
+            return MP4(filename)
+        finally:
+            os.unlink(filename)
+
+    def test_text_track_only(self):
+        audio = self.load(_build_chapter_mp4([
+            _qt_text_sample("Intro"),
+            _qt_text_sample("Part Two")]))
+        chapters = audio.chapters
+        self.failUnlessEqual(len(chapters), 2)
+        self.failUnlessEqual(chapters[0].title, "Intro")
+        self.failUnlessEqual(chapters[1].title, "Part Two")
+        self.failUnlessAlmostEqual(chapters[0].start, 0.0, 6)
+        self.failUnlessAlmostEqual(chapters[1].start, 1.0, 6)
+
+    def test_both_sources_text_track_wins(self):
+        audio = self.load(_build_chapter_mp4(
+            [_qt_text_sample("Track One"), _qt_text_sample("Track Two")],
+            chpl_entries=[(0, "Nero One"), (5, "Nero Two")]))
+        titles = [c.title for c in audio.chapters]
+        self.failUnlessEqual(titles, ["Track One", "Track Two"])
+
+    def test_chpl_only(self):
+        audio = self.load(_build_chapter_mp4(
+            [], tref_ids=(), chpl_entries=[(0, "A"), (3.5, "B")]))
+        chapters = audio.chapters
+        self.failUnlessEqual([c.title for c in chapters], ["A", "B"])
+        self.failUnlessAlmostEqual(chapters[1].start, 3.5, 6)
+
+    def test_multi_sample_chunks_and_co64(self):
+        audio = self.load(_build_chapter_mp4(
+            [_qt_text_sample("A"), _qt_text_sample("BB"),
+             _qt_text_sample("CCC"), _qt_text_sample("DDDD"),
+             _qt_text_sample("EEEEE")],
+            chunk_layout=[[0, 1, 2], [3, 4]], use_co64=True))
+        chapters = audio.chapters
+        self.failUnlessEqual(
+            [c.title for c in chapters], ["A", "BB", "CCC", "DDDD", "EEEEE"])
+        self.failUnlessEqual(
+            [round(c.start, 6) for c in chapters], [0.0, 1.0, 2.0, 3.0, 4.0])
+
+    def test_timescale_scaled(self):
+        audio = self.load(_build_chapter_mp4(
+            [_qt_text_sample("A"), _qt_text_sample("B"), _qt_text_sample("C")],
+            timescale=44100, deltas=[44100, 22050, 44100]))
+        starts = [c.start for c in audio.chapters]
+        self.failUnlessAlmostEqual(starts[0], 0.0, 6)
+        self.failUnlessAlmostEqual(starts[1], 1.0, 6)
+        self.failUnlessAlmostEqual(starts[2], 1.5, 6)
+
+    def test_uniform_sample_size(self):
+        audio = self.load(_build_chapter_mp4(
+            [_qt_text_sample("AAA"), _qt_text_sample("BBB")], uniform=16))
+        self.failUnlessEqual([c.title for c in audio.chapters],
+                             ["AAA", "BBB"])
+
+    def test_utf16_bom(self):
+        title = u"Café 测试"
+        audio = self.load(_build_chapter_mp4(
+            [_qt_text_sample(title.encode("utf-16"))]))
+        self.failUnlessEqual(audio.chapters[0].title, title)
+
+    def test_declared_utf16be(self):
+        title = u"测试"
+        raw = struct.pack(">H", len(title.encode("utf-16-be"))) + \
+            title.encode("utf-16-be") + _mp4_box(
+                b"encd", struct.pack(">I", 0x10000100))
+        audio = self.load(_build_chapter_mp4([raw]))
+        self.failUnlessEqual(audio.chapters[0].title, title)
+
+    def test_empty_edit_shifts_starts(self):
+        audio = self.load(_build_chapter_mp4(
+            [_qt_text_sample("A"), _qt_text_sample("B")],
+            elst_entries=[(3000, -1, 0x10000)]))
+        starts = [c.start for c in audio.chapters]
+        self.failUnlessAlmostEqual(starts[0], 3.0, 6)
+        self.failUnlessAlmostEqual(starts[1], 4.0, 6)
+
+    def test_broken_reference_falls_back_to_chpl(self):
+        audio = self.load(_build_chapter_mp4(
+            [_qt_text_sample("Track")], tref_ids=(99,),
+            chpl_entries=[(0, "Fallback")]))
+        self.failUnlessEqual([c.title for c in audio.chapters], ["Fallback"])
+
+    def test_broken_reference_no_fallback(self):
+        audio = self.load(_build_chapter_mp4(
+            [_qt_text_sample("Track")], tref_ids=(99,)))
+        self.failUnlessEqual(len(audio.chapters), 0)
+
+    def test_incomplete_stts_falls_back_to_chpl(self):
+        audio = self.load(_build_chapter_mp4(
+            [_qt_text_sample("One"), _qt_text_sample("Two")],
+            deltas=[1000, 2000], incomplete_stts=True,
+            chpl_entries=[(0, "Fallback A"), (9, "Fallback B")]))
+        self.failUnlessEqual([c.title for c in audio.chapters],
+                             ["Fallback A", "Fallback B"])
+
+    def test_missing_chunk_offsets(self):
+        audio = self.load(_build_chapter_mp4(
+            [_qt_text_sample("One")], missing_stco=True))
+        self.failUnlessEqual(len(audio.chapters), 0)
+
+    def test_truncated_tref_does_not_break_opening(self):
+        data = _build_chapter_mp4([_qt_text_sample("One")])
+        # Corrupt the 'chap' box size so the reference can't be parsed.
+        index = data.index(b"chap")
+        broken = data[:index - 4] + b"\xff\xff\xff\xff" + data[index:]
+        filename = _write_temp(broken)
+        try:
+            audio = MP4(filename)
+        finally:
+            os.unlink(filename)
+        self.failUnless(not audio.chapters)
+
+    def test_no_chapters(self):
+        audio = self.load(_build_chapter_mp4([], tref_ids=()))
+        self.failUnlessEqual(audio.chapters, None)
 
 
 def call_faad(*args):

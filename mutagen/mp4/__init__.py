@@ -904,12 +904,319 @@ class Chapter(object):
         self.title = title
 
 
+# Text encodings which can appear in the 'encd' sample modifier of a
+# QuickTime text sample. Both the CoreFoundation and the older
+# Carbon TextEncoding spellings are accepted. Unicode text normally
+# carries a BOM which takes precedence over this table.
+_QT_TEXT_ENCODINGS = {
+    0x00000000: "mac_roman",  # kCFStringEncodingMacRoman
+    0x00000201: "iso-8859-1",  # kCFStringEncodingISOLatin1
+    0x00000202: "iso-8859-2",  # kCFStringEncodingISOLatin2
+    0x08000100: "utf-8",  # kCFStringEncodingUTF8
+    0x08000103: "utf-8",  # kTextEncodingUTF8
+    0x10000100: "utf-16-be",  # kCFStringEncodingUTF16BE
+    0x14000100: "utf-16-le",  # kCFStringEncodingUTF16LE
+    0x00001001: "utf-16-be",  # kTextEncodingUTF16BE
+    0x00001401: "utf-16-le",  # kTextEncodingUTF16LE
+}
+
+
+def _read_atom(atom, fileobj):
+    """Read an atom's payload or raise MP4MetadataError."""
+
+    ok, data = atom.read(fileobj)
+    if not ok:
+        raise MP4MetadataError("Not enough data for %r" % atom.name)
+    return data
+
+
+def _iter_boxes(data):
+    """Yield (name, payload) for the boxes stored in data.
+
+    'tref' and 'edts' are not parsed as containers by Atoms, so their
+    child boxes are parsed here. Truncated data simply ends the list.
+    """
+
+    pos = 0
+    while pos + 8 <= len(data):
+        size, name = struct.unpack(">I4s", data[pos:pos + 8])
+        header = 8
+        if size == 1:
+            if pos + 16 > len(data):
+                break
+            size = struct.unpack(">Q", data[pos + 8:pos + 16])[0]
+            header = 16
+        elif size == 0:
+            size = len(data) - pos
+        if size < header or pos + size > len(data):
+            break
+        yield name, data[pos + header:pos + size]
+        pos += size
+
+
+def _find_box(data, name):
+    """Return the payload of the first child box called name or None."""
+
+    for box_name, payload in _iter_boxes(data):
+        if box_name == name:
+            return payload
+    return None
+
+
+def _parse_tkhd_id(data):
+    """Extract the track ID from a tkhd atom payload."""
+
+    try:
+        version, _flags, payload = parse_full_atom(data)
+    except ValueError as e:
+        raise MP4MetadataError(e)
+
+    if version == 0:
+        pos = 8  # creation, modification
+    elif version == 1:
+        pos = 16
+    else:
+        raise MP4MetadataError("Unknown tkhd version %d" % version)
+
+    if pos + 4 > len(payload):
+        raise MP4MetadataError("Invalid tkhd")
+    return struct.unpack(">I", payload[pos:pos + 4])[0]
+
+
+def _parse_mdhd_timescale(data):
+    """Extract the timescale from a mdhd atom payload."""
+
+    try:
+        version, _flags, payload = parse_full_atom(data)
+    except ValueError as e:
+        raise MP4MetadataError(e)
+
+    if version == 0:
+        pos = 8  # creation, modification
+        if pos + 8 > len(payload):
+            raise MP4MetadataError("Invalid mdhd")
+        timescale = struct.unpack(">I", payload[pos:pos + 4])[0]
+    elif version == 1:
+        pos = 16
+        if pos + 12 > len(payload):
+            raise MP4MetadataError("Invalid mdhd")
+        timescale = struct.unpack(">I", payload[pos:pos + 4])[0]
+    else:
+        raise MP4MetadataError("Unknown mdhd version %d" % version)
+
+    if not timescale:
+        raise MP4MetadataError("Invalid chapter track timescale")
+    return timescale
+
+
+def _parse_stts_times(data, timescale, sample_count):
+    """Return the start time in seconds of every sample in a stts table."""
+
+    try:
+        _version, _flags, payload = parse_full_atom(data)
+    except ValueError as e:
+        raise MP4MetadataError(e)
+
+    if len(payload) < 4:
+        raise MP4MetadataError("Invalid stts")
+
+    count = struct.unpack(">I", payload[:4])[0]
+    if 4 + count * 8 > len(payload):
+        raise MP4MetadataError("Invalid stts")
+
+    starts = []
+    time = 0
+    for i in range(count):
+        pos = 4 + i * 8
+        sample_delta_count, delta = struct.unpack(">2I", payload[pos:pos + 8])
+        # Only the first sample_count samples are needed. Incomplete tables
+        # are rejected below.
+        while sample_delta_count and len(starts) < sample_count:
+            starts.append(time / timescale)
+            time += delta
+            sample_delta_count -= 1
+        if len(starts) >= sample_count:
+            break
+
+    if len(starts) < sample_count:
+        raise MP4MetadataError("Incomplete stts")
+    return starts
+
+
+def _parse_stsz(data):
+    """Return (sample_size, sample_count, payload) from a stsz table."""
+
+    try:
+        _version, _flags, payload = parse_full_atom(data)
+    except ValueError as e:
+        raise MP4MetadataError(e)
+
+    if len(payload) < 8:
+        raise MP4MetadataError("Invalid stsz")
+
+    sample_size, sample_count = struct.unpack(">II", payload[:8])
+    if sample_size == 0 and sample_count * 4 > len(payload) - 8:
+        raise MP4MetadataError("Incomplete stsz")
+
+    return sample_size, sample_count, payload
+
+
+def _parse_stsc(data):
+    """Return a list of (first_chunk, samples_per_chunk) runs."""
+
+    try:
+        _version, _flags, payload = parse_full_atom(data)
+    except ValueError as e:
+        raise MP4MetadataError(e)
+
+    if len(payload) < 4:
+        raise MP4MetadataError("Invalid stsc")
+
+    count = struct.unpack(">I", payload[:4])[0]
+    if 4 + count * 12 > len(payload):
+        raise MP4MetadataError("Invalid stsc")
+
+    runs = []
+    for i in range(count):
+        pos = 4 + i * 12
+        first_chunk, samples_per_chunk, _description = \
+            struct.unpack(">3I", payload[pos:pos + 12])
+        runs.append((first_chunk, samples_per_chunk))
+
+    if not runs:
+        raise MP4MetadataError("Invalid stsc")
+    return runs
+
+
+def _parse_chunk_offsets(data, wide):
+    """Return the chunk offsets from a stco or co64 table."""
+
+    try:
+        _version, _flags, payload = parse_full_atom(data)
+    except ValueError as e:
+        raise MP4MetadataError(e)
+
+    if len(payload) < 4:
+        raise MP4MetadataError("Invalid chunk offset table")
+
+    count = struct.unpack(">I", payload[:4])[0]
+    size = 8 if wide else 4
+    if 4 + count * size > len(payload):
+        raise MP4MetadataError("Incomplete chunk offset table")
+
+    fmt = ">%d%s" % (count, "Q" if wide else "I")
+    return list(struct.unpack(fmt, payload[4:4 + count * size]))
+
+
+def _sample_offsets(chunks, runs, sizes, sample_count):
+    """Map every sample to a file offset following the stsc/stsz tables."""
+
+    offsets = []
+    index = 0
+    run_index = 0
+    samples_per_chunk = runs[0][1]
+    for chunk_index, chunk_offset in enumerate(chunks, 1):
+        # Advance to the stsc run which covers this chunk. Tables which
+        # don't start at chunk 1 keep using their first run.
+        while (run_index + 1 < len(runs) and
+               runs[run_index + 1][0] <= chunk_index):
+            run_index += 1
+            samples_per_chunk = runs[run_index][1]
+
+        pos = chunk_offset
+        for _ in range(samples_per_chunk):
+            if index >= sample_count:
+                break
+            offsets.append(pos)
+            pos += sizes[index]
+            index += 1
+        if index >= sample_count:
+            break
+
+    if index < sample_count:
+        raise MP4MetadataError("Incomplete sample table")
+    return offsets
+
+
+def _decode_qt_text(data, encoding=None):
+    """Decode the text part of a QuickTime text sample.
+
+    A byte order mark decides the encoding if present. Otherwise the
+    'encd' modifier is used: UTF-16 is always decoded with the declared
+    variant, while for everything else UTF-8 is tried first (many muxers
+    write UTF-8 regardless of the declared legacy encoding) before
+    falling back to the declared codec and finally Latin-1.
+    """
+
+    if data.startswith(b"\xef\xbb\xbf"):  # UTF-8 BOM
+        return data[3:].decode("utf-8", "replace")
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):  # UTF-16 BOM
+        return data.decode("utf-16", "replace")
+
+    codec = _QT_TEXT_ENCODINGS.get(encoding)
+
+    if codec is not None and codec.startswith("utf-16"):
+        try:
+            return data.decode(codec)
+        except UnicodeDecodeError:
+            pass
+
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+
+    if codec is not None:
+        try:
+            return data.decode(codec)
+        except UnicodeDecodeError:
+            pass
+
+    return data.decode("latin-1", "replace")
+
+
+def _parse_qt_text_sample(data):
+    """Parse a QuickTime text sample into a chapter title.
+
+    The format is a 2 byte big endian text length followed by the text
+    and an optional list of modifier atoms (e.g. 'encd').
+    """
+
+    if len(data) < 2:
+        raise MP4MetadataError("Invalid chapter text sample")
+
+    length = struct.unpack(">H", data[:2])[0]
+    if 2 + length > len(data):
+        raise MP4MetadataError("Invalid chapter text sample")
+
+    text = data[2:2 + length]
+    encoding = None
+    pos = 2 + length
+    while pos + 8 <= len(data):
+        size, name = struct.unpack(">I4s", data[pos:pos + 8])
+        if size < 8:
+            break
+        payload = data[pos + 8:pos + size]
+        if name == b"encd" and len(payload) >= 4:
+            # 'encd' is a full box, the encoding follows the version/flags
+            if len(payload) >= 8:
+                encoding = struct.unpack(">I", payload[4:8])[0]
+            else:
+                encoding = struct.unpack(">I", payload[:4])[0]
+        pos += size
+
+    return _decode_qt_text(text, encoding).rstrip("\x00")
+
+
 class MP4Chapters(Sequence):
     """MP4Chapters()
 
     MPEG-4 Chapter information.
 
-    Supports the 'moov.udta.chpl' box.
+    Supports the 'moov.udta.chpl' box and QuickTime chapter tracks
+    referenced by the audio track ('moov.trak.tref.chap'). If both are
+    present the chapter track is preferred; if it can't be read the
+    'chpl' box is used.
 
     A sequence of Chapter objects with the following members:
         start (`float`): position from the start of the file in seconds
@@ -942,6 +1249,17 @@ class MP4Chapters(Sequence):
         if not self._timescale:
             raise MP4MetadataError("Unable to get timescale")
 
+        # QuickTime chapter tracks take precedence, but a broken reference
+        # or an incomplete sample table shouldn't prevent reading the file
+        # or hide chapters from the 'chpl' box.
+        try:
+            chapters = self._parse_chapter_tracks(atoms, fileobj)
+        except (MP4MetadataError, KeyError, ValueError, struct.error):
+            chapters = []
+        if chapters:
+            self._chapters = chapters
+            return
+
         try:
             chpl = atoms.path(b"moov", b"udta", b"chpl")[-1]
         except KeyError as key:
@@ -950,8 +1268,56 @@ class MP4Chapters(Sequence):
         self._parse_chpl(chpl, fileobj)
 
     @classmethod
-    def _can_load(cls, atoms):
-        return b"moov.udta.chpl" in atoms and b"moov.mvhd" in atoms
+    def _can_load(cls, atoms, fileobj=None):
+        if b"moov.mvhd" not in atoms:
+            return False
+
+        if b"moov.udta.chpl" in atoms:
+            return True
+
+        if fileobj is not None:
+            try:
+                return bool(cls._chapter_track_ids(atoms, fileobj))
+            except (MP4MetadataError, KeyError, ValueError, struct.error):
+                return False
+
+        # Without access to the data only a tentative answer is possible.
+        try:
+            moov = atoms[b"moov"]
+        except KeyError:
+            return False
+        for trak in moov.findall(b"trak"):
+            if b"tref" in [child.name for child in trak.children or []]:
+                return True
+        return False
+
+    @staticmethod
+    def _chapter_track_ids(atoms, fileobj):
+        """Return the track IDs referenced as chapters by the audio track."""
+
+        try:
+            moov = atoms[b"moov"]
+        except KeyError:
+            return []
+
+        for trak in moov.findall(b"trak"):
+            try:
+                handler = _read_atom(trak[b"mdia", b"hdlr"], fileobj)
+                if len(handler) < 12 or handler[8:12] != b"soun":
+                    continue
+                tref = trak[b"tref",]
+                chap = _find_box(_read_atom(tref, fileobj), b"chap")
+            except (KeyError, MP4MetadataError):
+                continue
+
+            if not chap:
+                return []
+
+            count = len(chap) // 4
+            if count:
+                return list(struct.unpack(">%dI" % count, chap[:count * 4]))
+
+        return []
 
     def _parse_mvhd(self, atom, fileobj):
         assert atom.name == b"mvhd"
@@ -979,6 +1345,176 @@ class MP4Chapters(Sequence):
 
             self._duration = struct.unpack(">q", data[pos:pos + 8])[0]
             pos += 8
+
+    def _find_track(self, moov, fileobj, track_id):
+        for trak in moov.findall(b"trak"):
+            try:
+                tkhd = trak[b"tkhd",]
+            except KeyError:
+                continue
+            if _parse_tkhd_id(_read_atom(tkhd, fileobj)) == track_id:
+                return trak
+        raise MP4MetadataError("Chapter track %d not found" % track_id)
+
+    def _is_text_track(self, trak, fileobj):
+        try:
+            handler = _read_atom(trak[b"mdia", b"hdlr"], fileobj)
+        except (KeyError, MP4MetadataError):
+            return False
+        return len(handler) >= 12 and handler[8:12] in (b"text", b"sbtl")
+
+    def _parse_elst(self, trak, fileobj, timescale):
+        """Return (empty_edit_seconds, media_start_seconds)."""
+
+        try:
+            edts = trak[b"edts",]
+        except KeyError:
+            return 0.0, 0.0
+
+        try:
+            data = _read_atom(edts, fileobj)
+        except MP4MetadataError:
+            return 0.0, 0.0
+
+        elst = _find_box(data, b"elst")
+        if elst is None:
+            return 0.0, 0.0
+
+        try:
+            version, _flags, payload = parse_full_atom(elst)
+        except ValueError:
+            return 0.0, 0.0
+
+        if len(payload) < 4:
+            return 0.0, 0.0
+
+        count = struct.unpack(">I", payload[:4])[0]
+        empty_edit = 0.0
+        media_start = 0.0
+        pos = 4
+        for _ in range(count):
+            if version == 0:
+                if pos + 12 > len(payload):
+                    break
+                seg_duration, media_time, _rate = \
+                    struct.unpack(">IiI", payload[pos:pos + 12])
+                pos += 12
+            elif version == 1:
+                if pos + 20 > len(payload):
+                    break
+                seg_duration, media_time, _rate = \
+                    struct.unpack(">QqI", payload[pos:pos + 20])
+                pos += 20
+            else:
+                break
+
+            if media_time == -1:
+                # An empty edit shifts the media in the movie timeline.
+                if self._timescale:
+                    empty_edit += seg_duration / self._timescale
+            else:
+                media_start = media_time / timescale
+                break
+
+        return empty_edit, media_start
+
+    def _parse_chapter_track(self, trak, fileobj):
+        """Return the chapters stored in a QuickTime text track.
+
+        Raises MP4MetadataError if the track can't be read completely.
+        """
+
+        try:
+            stbl = trak[b"mdia", b"minf", b"stbl"]
+        except KeyError as e:
+            raise MP4MetadataError(e)
+
+        timescale = _parse_mdhd_timescale(
+            _read_atom(trak[b"mdia", b"mdhd"], fileobj))
+        empty_edit, media_start = self._parse_elst(trak, fileobj, timescale)
+
+        sample_size, sample_count, stsz_payload = _parse_stsz(
+            _read_atom(stbl[b"stsz",], fileobj))
+        if sample_count == 0:
+            return []
+
+        try:
+            file_size = get_size(fileobj)
+        except (IOError, OSError) as e:
+            raise MP4MetadataError(e)
+
+        # Every sample needs at least a two byte length field, so a count
+        # larger than the file size indicates a broken table (and would
+        # otherwise allow huge allocations).
+        if sample_count > file_size // 2:
+            raise MP4MetadataError("Invalid sample count")
+
+        if sample_size:
+            sizes = [sample_size] * sample_count
+        else:
+            sizes = list(struct.unpack(
+                ">%dI" % sample_count,
+                stsz_payload[8:8 + 4 * sample_count]))
+
+        starts = _parse_stts_times(
+            _read_atom(stbl[b"stts",], fileobj), timescale, sample_count)
+        runs = _parse_stsc(_read_atom(stbl[b"stsc",], fileobj))
+
+        try:
+            stco = stbl[b"stco",]
+        except KeyError:
+            try:
+                co64 = stbl[b"co64",]
+            except KeyError as e:
+                raise MP4MetadataError(e)
+            chunks = _parse_chunk_offsets(_read_atom(co64, fileobj), True)
+        else:
+            chunks = _parse_chunk_offsets(_read_atom(stco, fileobj), False)
+
+        offsets = _sample_offsets(chunks, runs, sizes, sample_count)
+
+        chapters = []
+        for i in range(sample_count):
+            offset, size = offsets[i], sizes[i]
+            if offset < 0 or size < 0 or offset + size > file_size:
+                raise MP4MetadataError("Invalid chapter sample offset")
+            fileobj.seek(offset)
+            sample = fileobj.read(size)
+            if len(sample) != size:
+                raise MP4MetadataError("Truncated chapter sample")
+
+            title = _parse_qt_text_sample(sample)
+            start = empty_edit + starts[i] - media_start
+            if start < 0:
+                start = 0.0
+            chapters.append(Chapter(start, title))
+
+        return chapters
+
+    def _parse_chapter_tracks(self, atoms, fileobj):
+        """Return chapters from the referenced QuickTime chapter tracks."""
+
+        track_ids = self._chapter_track_ids(atoms, fileobj)
+        if not track_ids:
+            return []
+
+        try:
+            moov = atoms[b"moov"]
+        except KeyError:
+            return []
+
+        for track_id in track_ids:
+            try:
+                trak = self._find_track(moov, fileobj, track_id)
+                if not self._is_text_track(trak, fileobj):
+                    continue
+                chapters = self._parse_chapter_track(trak, fileobj)
+            except (MP4MetadataError, KeyError, ValueError, struct.error):
+                continue
+            if chapters:
+                return chapters
+
+        return []
 
     def _parse_chpl(self, atom, fileobj):
         assert atom.name == b"chpl"
@@ -1187,6 +1723,8 @@ class MP4(FileType):
     Attributes:
         info (`MP4Info`)
         tags (`MP4Tags`)
+        chapters (`MP4Chapters` or `None`): chapters from a QuickTime
+            chapter track or the ``chpl`` box, if the file has any
     """
 
     MP4Tags = MP4Tags
@@ -1223,7 +1761,7 @@ class MP4(FileType):
             except Exception as err:
                 reraise(MP4MetadataError, err, sys.exc_info()[2])
 
-        if not MP4Chapters._can_load(atoms):
+        if not self.MP4Chapters._can_load(atoms, fileobj):
             self.chapters = None
         else:
             try:
